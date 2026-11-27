@@ -1,17 +1,20 @@
 
 import json
 import re
+import threading
 import numpy as np
 
 from pathlib import Path
+from functools import lru_cache
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastembed import TextEmbedding
 
-# --------------------------------------------------
-# 1. INITIALIZE APPLICATION
-# --------------------------------------------------
+
+# ==================================================
+# 1. APPLICATION
+# ==================================================
 
 app = FastAPI(title="RAG Colosseum API")
 
@@ -30,9 +33,12 @@ model = TextEmbedding(
     threads=1
 )
 
-# --------------------------------------------------
+model_lock = threading.Lock()
+
+
+# ==================================================
 # 2. LOAD KNOWLEDGE BASE
-# --------------------------------------------------
+# ==================================================
 
 DATA_PATH = Path("data/dataset.json")
 
@@ -80,9 +86,11 @@ def load_passages(data):
 
     if len(passages) != 50:
         raise ValueError(
-            f"Expected 50 passages, loaded {len(passages)}. "
-            "Check dataset.json format."
+            f"Expected 50 passages, got {len(passages)}"
         )
+
+    if [p["id"] for p in passages] != list(range(50)):
+        raise ValueError("Passage IDs must be 0 to 49")
 
     return passages
 
@@ -92,23 +100,67 @@ passages = load_passages(raw_data)
 texts = [p["text"] for p in passages]
 passage_ids = [p["id"] for p in passages]
 
-# --------------------------------------------------
-# 3. GENERATE PASSAGE EMBEDDINGS
-# --------------------------------------------------
 
-def normalize_embeddings(vectors):
-    vectors = np.asarray(vectors, dtype=np.float32)
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    return vectors / np.maximum(norms, 1e-12)
+# ==================================================
+# 3. TOKENIZATION AND LEXICAL RETRIEVAL
+# ==================================================
+
+STOPWORDS = {
+    "what", "which", "who", "when", "where", "why",
+    "how", "is", "are", "was", "were", "the", "a",
+    "an", "of", "in", "on", "to", "for", "and",
+    "or", "does", "do", "did", "can", "could",
+    "would", "should", "with", "by", "from",
+    "used", "use", "using", "about", "explain",
+    "tell", "me", "please", "give", "describe",
+    "according", "passage", "system"
+}
 
 
-passage_embeddings = normalize_embeddings(
-    list(model.embed(texts, batch_size=16))
-)
+def tokenize(text):
 
-# --------------------------------------------------
-# 4. SPLIT PASSAGES INTO SENTENCES
-# --------------------------------------------------
+    words = re.findall(
+        r"[a-z0-9]+(?:\.[0-9]+)?",
+        text.lower()
+    )
+
+    result = []
+
+    for word in words:
+
+        if word in STOPWORDS:
+            continue
+
+        # Basic plural normalization
+        if len(word) > 4 and word.endswith("ies"):
+            word = word[:-3] + "y"
+
+        elif len(word) > 4 and word.endswith("s") \
+                and not word.endswith("ss"):
+            word = word[:-1]
+
+        result.append(word)
+
+    return result
+
+
+def lexical_coverage(question, document):
+
+    query_terms = set(tokenize(question))
+
+    if not query_terms:
+        return 0.0
+
+    document_terms = set(tokenize(document))
+
+    matched = query_terms.intersection(document_terms)
+
+    return len(matched) / len(query_terms)
+
+
+# ==================================================
+# 4. SENTENCE SPLITTING
+# ==================================================
 
 sentence_records = []
 
@@ -131,100 +183,265 @@ for passage in passages:
 
 
 sentence_texts = [
-    s["text"] for s in sentence_records
+    item["text"] for item in sentence_records
 ]
+
+
+# ==================================================
+# 5. GENERATE EMBEDDINGS
+# ==================================================
+
+def normalize_embeddings(vectors):
+
+    vectors = np.asarray(
+        vectors,
+        dtype=np.float32
+    )
+
+    norms = np.linalg.norm(
+        vectors,
+        axis=1,
+        keepdims=True
+    )
+
+    return vectors / np.maximum(norms, 1e-12)
+
+
+passage_embeddings = normalize_embeddings(
+    list(model.embed(texts, batch_size=16))
+)
 
 sentence_embeddings = normalize_embeddings(
     list(model.embed(sentence_texts, batch_size=16))
 )
 
-# --------------------------------------------------
-# 5. REQUEST FORMAT
-# --------------------------------------------------
+
+# ==================================================
+# 6. REQUEST MODEL
+# ==================================================
 
 class QueryRequest(BaseModel):
-    question: str
-    top_k: int = 3
+
+    question: str = Field(min_length=1)
+
+    top_k: int = Field(
+        default=3,
+        ge=1,
+        le=10
+    )
 
 
-# --------------------------------------------------
-# 6. RETRIEVAL
-# --------------------------------------------------
+# ==================================================
+# 7. PROMPT INJECTION DETECTION
+# ==================================================
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"disregard\s+(all\s+)?instructions",
+    r"reveal\s+(the\s+)?system\s+prompt",
+    r"show\s+(the\s+)?system\s+prompt",
+    r"print\s+(your\s+)?(hidden\s+)?instructions",
+    r"reveal\s+(your\s+)?hidden\s+instructions",
+    r"act\s+as\s+system",
+    r"override\s+(all\s+)?instructions",
+    r"forget\s+(all\s+)?previous\s+instructions"
+]
+
+
+def is_injection(question):
+
+    q = question.lower()
+
+    return any(
+        re.search(pattern, q)
+        for pattern in INJECTION_PATTERNS
+    )
+
+
+# ==================================================
+# 8. QUERY EMBEDDING
+# ==================================================
+
+@lru_cache(maxsize=256)
+def get_query_embedding(question):
+
+    with model_lock:
+
+        embedding = list(
+            model.query_embed(question)
+        )
+
+    return normalize_embeddings(embedding)[0]
+
+
+# ==================================================
+# 9. HYBRID PASSAGE RETRIEVAL
+# ==================================================
 
 def retrieve(question, top_k):
 
-    query_embedding = normalize_embeddings(
-        list(model.query_embed(question))
-    )[0]
+    query_embedding = get_query_embedding(question)
 
-    similarities = passage_embeddings @ query_embedding
+    dense_scores = (
+        passage_embeddings @ query_embedding
+    )
 
-    ranked_indices = np.argsort(
-        similarities
+    lexical_scores = np.array([
+        lexical_coverage(question, text)
+        for text in texts
+    ])
+
+    # Combine semantic and lexical relevance
+    hybrid_scores = (
+        0.72 * np.clip(dense_scores, 0, 1)
+        + 0.28 * lexical_scores
+    )
+
+    ranked = np.argsort(
+        hybrid_scores
     )[::-1]
 
     results = []
 
-    for idx in ranked_indices[:top_k]:
+    for idx in ranked[:top_k]:
 
         results.append({
             "id": passage_ids[idx],
             "text": texts[idx],
-            "score": float(similarities[idx])
+            "score": float(hybrid_scores[idx]),
+            "dense": float(dense_scores[idx]),
+            "lexical": float(lexical_scores[idx])
         })
 
     return results, query_embedding
 
 
-# --------------------------------------------------
-# 7. ANSWER EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 10. SENTENCE-LEVEL ANSWER EXTRACTION
+# ==================================================
 
-def extract_answer(question, query_embedding):
+def extract_answer(question, query_embedding, results):
 
-    similarities = (
+    eligible_ids = {
+        item["id"] for item in results
+    }
+
+    eligible_indices = [
+        i for i, item in enumerate(sentence_records)
+        if item["passage_id"] in eligible_ids
+    ]
+
+    if not eligible_indices:
+        return None, 0.0, []
+
+    dense_scores = (
         sentence_embeddings @ query_embedding
     )
 
-    ranked = np.argsort(similarities)[::-1]
+    candidates = []
 
-    best_score = float(similarities[ranked[0]])
+    for idx in eligible_indices:
 
-    # Abstain if no sufficiently relevant sentence exists
-    if best_score < 0.30:
-        return None, best_score, []
+        item = sentence_records[idx]
 
-    best = sentence_records[ranked[0]]
+        dense = float(dense_scores[idx])
+
+        lexical = lexical_coverage(
+            question,
+            item["text"]
+        )
+
+        score = (
+            0.72 * max(0.0, dense)
+            + 0.28 * lexical
+        )
+
+        candidates.append({
+            "passage_id": item["passage_id"],
+            "text": item["text"],
+            "score": score,
+            "dense": dense,
+            "lexical": lexical
+        })
+
+    candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    best = candidates[0]
+
+    # Reject unrelated and weakly supported questions
+    if (
+        best["dense"] < 0.32
+        or (
+            best["dense"] < 0.48
+            and best["lexical"] < 0.25
+        )
+    ):
+        return None, best["score"], []
 
     selected = [best]
 
-    # Allow a second sentence for cross-passage synthesis
-    for idx in ranked[1:]:
+    # Cross-passage synthesis
+    compare_words = {
+        "compare", "difference", "differences",
+        "versus", "between", "both", "contrast"
+    }
 
-        score = float(similarities[idx])
+    query_words = set(tokenize(question))
 
-        candidate = sentence_records[idx]
+    is_comparison = bool(
+        query_words.intersection(compare_words)
+    )
 
-        if (
-            score >= max(0.30, best_score - 0.07)
-            and candidate["passage_id"] != best["passage_id"]
-            and len(selected) < 2
-        ):
-            selected.append(candidate)
+    for candidate in candidates[1:]:
 
-        if len(selected) == 2:
+        if len(selected) >= 2:
             break
 
+        if candidate["passage_id"] in {
+            item["passage_id"] for item in selected
+        }:
+            continue
+
+        if candidate["dense"] < 0.38:
+            continue
+
+        if candidate["lexical"] < 0.20:
+            continue
+
+        # Avoid unrelated second sentences
+        if candidate["score"] < best["score"] - 0.12:
+            continue
+
+        selected.append(candidate)
+
+    # Keep the extracted factual sentences intact
     answer = " ".join(
         item["text"] for item in selected
     )
 
-    return answer, best_score, selected
+    return answer, best["score"], selected
 
 
-# --------------------------------------------------
-# 8. MAIN QUERY ENDPOINT
-# --------------------------------------------------
+# ==================================================
+# 11. RESPONSE FORMAT
+# ==================================================
+
+def abstain():
+
+    return {
+        "answer": None,
+        "sources": [],
+        "scores": [],
+        "confidence": 0.20
+    }
+
+
+# ==================================================
+# 12. MAIN API ENDPOINT
+# ==================================================
 
 @app.post("/query")
 def query_api(request: QueryRequest):
@@ -232,81 +449,84 @@ def query_api(request: QueryRequest):
     question = request.question.strip()
 
     if not question:
-        return {
-            "answer": None,
-            "sources": [],
-            "scores": [],
-            "confidence": 0.0
-        }
+        return abstain()
 
-    top_k = max(1, min(request.top_k, 10))
+    # Reject direct instruction override attempts
+    if is_injection(question):
+        return abstain()
 
+    top_k = request.top_k
+
+    # Retrieve relevant passages
     results, query_embedding = retrieve(
         question,
         top_k
     )
 
+    # Extract factual answer only from retrieved passages
     answer, answer_score, selected = extract_answer(
         question,
-        query_embedding
+        query_embedding,
+        results
     )
 
-    # Abstention threshold
-    if answer is None or answer_score < 0.30:
+    if answer is None:
+        return abstain()
 
-        return {
-            "answer": None,
-            "sources": [],
-            "scores": [],
-            "confidence": 0.20
-        }
-
-    # Keep only passages that support the extracted answer
-    source_ids = list(dict.fromkeys(
+    # Supporting source passages
+    selected_ids = {
         item["passage_id"] for item in selected
-    ))
-
-    # Include other retrieved passages as supporting context
-    for item in results:
-        if item["id"] not in source_ids:
-            source_ids.append(item["id"])
-
-    source_ids = source_ids[:top_k]
-
-    score_lookup = {
-        item["id"]: item["score"]
-        for item in results
     }
 
-    source_ids.sort(
-        key=lambda x: score_lookup.get(x, 0),
+    source_results = [
+        item for item in results
+        if item["id"] in selected_ids
+    ]
+
+    # Add other retrieved passages if space is available
+    for item in results:
+
+        if len(source_results) >= top_k:
+            break
+
+        if item["id"] not in {
+            x["id"] for x in source_results
+        }:
+            source_results.append(item)
+
+    source_results.sort(
+        key=lambda x: x["score"],
         reverse=True
     )
 
+    sources = [
+        item["id"] for item in source_results
+    ]
+
     scores = [
         round(
-            max(0.0, min(1.0, score_lookup[sid])),
+            max(0.0, min(1.0, item["score"])),
             4
         )
-        for sid in source_ids
+        for item in source_results
     ]
 
     confidence = min(
         0.99,
-        max(0.0, answer_score)
+        max(0.61, answer_score)
     )
 
     return {
         "answer": answer,
-        "sources": source_ids,
+        "sources": sources,
         "scores": scores,
         "confidence": round(confidence, 4)
     }
 
 
-# --------------------------------------------------
-# 9. HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
+# 13. HEALTH CHECK
+# ==================================================
 
 @app.get("/")
 def home():
@@ -320,4 +540,7 @@ def home():
 @app.get("/health")
 def health():
 
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "passages_loaded": len(passages)
+    }
