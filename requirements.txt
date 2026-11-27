@@ -1,4 +1,7 @@
-fastapi==0.115.12
-uvicorn==0.34.0
-fastembed==0.9.1
-numpy==1.26.4
+fastapi
+uvicorn[standard]
+sentence-transformers
+rank-bm25
+numpy
+transformers
+torch

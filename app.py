@@ -1,203 +1,379 @@
-"""Small, self-contained RAG API for the RAG Colosseum probe."""
-from __future__ import annotations
 
 import json
-import logging
-import os
 import re
-import threading
-from contextlib import asynccontextmanager
+import math
 from pathlib import Path
-from typing import Any
+from collections import Counter
 
-import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("rag")
-BASE = Path(__file__).resolve().parent
-MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+from typing import Optional
 
 
-class Query(BaseModel):
-    question: str = Field(min_length=1, max_length=4000)
-    top_k: int = Field(default=3, ge=1, le=10)
+# --------------------------------------------------
+# 1. Load the knowledge base
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+KB_PATH = BASE_DIR / "knowledge_base.json"
+
+with open(KB_PATH, "r", encoding="utf-8") as file:
+    passages = json.load(file)
+
+if not isinstance(passages, list) or not passages:
+    raise ValueError("Knowledge base must be a non-empty JSON list.")
+
+if not all(isinstance(p, str) for p in passages):
+    raise ValueError("Every passage must be a string.")
+
+print(f"Loaded {len(passages)} passages.")
 
 
-class RagEngine:
-    def __init__(self) -> None:
-        self.passages = json.loads((BASE / "knowledge_base.json").read_text(encoding="utf-8"))
-        if not isinstance(self.passages, list) or len(self.passages) != 50 or not all(isinstance(x, str) for x in self.passages):
-            raise RuntimeError("knowledge_base.json must contain exactly 50 passage strings")
-        # FastEmbed uses quantized ONNX inference and avoids importing PyTorch
-        # (and its large CUDA dependencies) on small free instances.
-        from fastembed import TextEmbedding
+# --------------------------------------------------
+# 2. Tokenization
+# --------------------------------------------------
 
-        self.model = TextEmbedding(model_name=MODEL_NAME, threads=1)
-        self.embeddings = self._encode(self.passages)
-        self.lock = threading.Lock()
-        log.info("Loaded %s passages and embedding model %s", len(self.passages), MODEL_NAME)
-
-    def retrieve(self, question: str, k: int) -> tuple[list[int], list[float]]:
-        query_vec = self._encode([question])[0]
-        sims = np.asarray(self.embeddings @ query_vec, dtype=np.float32)
-        # Stable ordering makes tied scores deterministic.
-        ranked = sorted(range(len(sims)), key=lambda i: (-float(sims[i]), i))[:k]
-        return ranked, [float(np.clip(sims[i], 0.0, 1.0)) for i in ranked]
-
-    def _encode(self, texts: list[str]) -> np.ndarray:
-        vectors = np.asarray(list(self.model.embed(texts)), dtype=np.float32)
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        np.divide(vectors, np.maximum(norms, 1e-12), out=vectors)
-        return vectors
-
-    def respond(self, question: str, k: int) -> dict[str, Any]:
-        q = question.strip()
-        ids, scores = self.retrieve(q, min(k, 5))
-        best = scores[0] if scores else 0.0
-        second = scores[1] if len(scores) > 1 else 0.0
-
-        if _is_unsafe_or_instructional(q) or _is_unanswerable(q):
-            return {"answer": None, "sources": [], "scores": [], "confidence": 0.15}
-        # Similarity plus a modest separation check avoids confident answers to
-        # near-domain questions unsupported by any passage.
-        if best < 0.28 or (best < 0.38 and best - second < 0.015):
-            return {"answer": None, "sources": [], "scores": [], "confidence": round(min(0.39, best), 4)}
-
-        answer, confidence = extract_answer(q, ids, self.passages)
-        if answer is None:
-            return {"answer": None, "sources": [], "scores": [], "confidence": round(min(0.39, best), 4)}
-        # Include the retrieved evidence used to support the extracted fact.
-        return {
-            "answer": answer,
-            "sources": ids,
-            "scores": [round(s, 4) for s in scores],
-            "confidence": round(float(np.clip(max(0.61, min(0.98, 0.55 + best * 0.4)), 0, 1)), 4),
-        }
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", text.lower())
 
 
-def _is_unsafe_or_instructional(q: str) -> bool:
-    # Treat attempts to override the task or retrieve hidden/system instructions
-    # as unsupported queries; knowledge base text remains the only evidence.
-    return bool(re.search(r"\b(ignore|disregard|override|reveal|show|print|repeat)\b.{0,60}\b(instructions?|prompt|system message|secrets?|api key)\b", q, re.I))
+# Remove common words that do not help retrieval
+STOPWORDS = {
+    "the", "is", "are", "was", "were", "a", "an",
+    "and", "or", "of", "to", "in", "on", "for",
+    "with", "by", "what", "which", "who", "when",
+    "where", "how", "does", "do", "did", "can",
+    "could", "would", "should", "about", "from",
+    "that", "this", "it", "its", "their", "they",
+    "be", "as", "at", "than", "explain", "describe",
+    "tell", "me", "please", "give", "show"
+}
 
 
-def _is_unanswerable(q: str) -> bool:
-    # These are fact-seeking questions about details not stated in the KB.
-    patterns = (
-        r"\b(who|what|which)\b.{0,60}\b(invented|founded|created|authored|maintains?)\b",
-        r"\b(latest|current|today|this year|in production at)\b",
-        r"\baccording to (?:the )?(?:paper|benchmark|experiment|study)\b",
-        r"\b(?:prove|derive|calculate|compute)\b.{0,50}\bfrom first principles\b",
-    )
-    return any(re.search(p, q, re.I) for p in patterns)
-
-
-def _topic_ids(question: str, ids: list[int], passages: list[str]) -> list[int]:
-    # Keep only retrieved passages sharing a meaningful subject phrase with the
-    # best hit. This is helpful for questions that ask to combine adjacent facts.
-    if not ids:
-        return []
-    best_text = passages[ids[0]].lower()
-    terms = [w for w in re.findall(r"[a-z0-9]+", best_text) if len(w) >= 4]
-    q_terms = set(re.findall(r"[a-z0-9]+", question.lower()))
-    anchors = q_terms.intersection(terms)
-    selected = [ids[0]]
-    for i in ids[1:]:
-        words = set(re.findall(r"[a-z0-9]+", passages[i].lower()))
-        if len(anchors.intersection(words)) >= 2:
-            selected.append(i)
-    return selected
-
-
-def extract_answer(question: str, ids: list[int], passages: list[str]) -> tuple[str | None, float]:
-    q = question.lower()
-    evidence_ids = _topic_ids(q, ids, passages)
-    text = " ".join(passages[i] for i in evidence_ids)
-
-    # Ask for a named concept/protocol's directly stated numeric property.
-    numeric_intents = [
-        (r"\b(?:quorum|how many nodes|number of nodes)\b", r"quorum of\s+(\d+)\s+nodes?", "nodes"),
-        (r"\b(?:how many|number of)\s+acceptors\b", r"quorum of\s+(\d+)\s+acceptors?", "acceptors"),
-        (r"\b(?:learning rate|step updates?)\b", r"learning rate(?: schedule)?(?: initializes step updates at| of| target(?:s)? of)?\s+(?:a\s+)?([0-9.]+)", ""),
-        (r"\b(?:batch size|mini.batch size|samples per (?:forward )?step)\b", r"(?:sizes? of|batches? of)\s+(\d+)\s+samples", "samples"),
-        (r"\b(?:port|listening port|default port|network port)\b", r"port\s+(\d+)", ""),
-        (r"\b(?:timeout|time out|dead interval|rto|latency)\b", r"(?:timeout|interval|rto|latency)[^.;]{0,45}?\b(\d+)\s*ms", "ms"),
-        (r"\b(?:ping interval|heartbeat)\b", r"(?:interval|heartbeats?) of\s+(\d+)\s*ms", "ms"),
-        (r"\b(?:blocks?|layers?)\b", r"(\d+)\s+(?:sequential )?(?:transformer blocks?|hidden dense layers?|attention layers?)", ""),
-        (r"\b(?:iterations?|iteration count)\b", r"iterations?[^.;]{0,50}?\b(\d+)\b", ""),
-        (r"\b(?:key size|key length|bits)\b", r"(?:keys? of|lengths? of|curves? of)\s+(\d+)\s*bits", "bits"),
-        (r"\b(?:retry.after|retry after|wait duration)\b", r"(\d+)\s*ms wait", "ms"),
-        (r"\b(?:retry|retries)\b", r"minimum of\s+(\d+)\s+service retries", "retries"),
-        (r"\b(?:threshold|burst capacity|burst threshold)\b", r"(?:threshold|capacity limit|ratio|exceeds? a)\s+(0\.\d+)", ""),
-        (r"\b(?:round.trip|round trip|handshake)\b", r"(single|one|two)-round-trip", "round trip(s)"),
-        (r"\b(?:ttl|time.to.live)\b", r"time-to-live attributes?", ""),
+def useful_tokens(text):
+    return [
+        token for token in tokenize(text)
+        if token not in STOPWORDS
     ]
-    for intent, value_pattern, unit in numeric_intents:
-        if re.search(intent, q):
-            m = re.search(value_pattern, text, re.I)
-            if m:
-                value = m.group(1)
-                if value.lower() == "single":
-                    value = "1"
-                elif value.lower() == "one":
-                    value = "1"
-                elif value.lower() == "two":
-                    value = "2"
-                return (f"{value} {unit}".strip(), 0.9)
 
-    # Conceptual questions: return the sentence most similar to the query,
-    # giving the answer as a faithful extract rather than adding unsupported facts.
+
+# --------------------------------------------------
+# 3. Build a lightweight BM25 index
+# --------------------------------------------------
+
+N = len(passages)
+
+tokenized_passages = [
+    tokenize(passage) for passage in passages
+]
+
+document_lengths = [
+    len(tokens) for tokens in tokenized_passages
+]
+
+average_length = (
+    sum(document_lengths) / N if N else 0
+)
+
+# Document frequency for every token
+document_frequency = Counter()
+
+for tokens in tokenized_passages:
+    document_frequency.update(set(tokens))
+
+
+def calculate_bm25(query):
+    query_tokens = useful_tokens(query)
+
+    if not query_tokens:
+        return [0.0] * N
+
+    k1 = 1.5
+    b = 0.75
+
+    scores = []
+
+    for doc_index, doc_tokens in enumerate(tokenized_passages):
+
+        term_counts = Counter(doc_tokens)
+        doc_length = document_lengths[doc_index]
+
+        score = 0.0
+
+        for term in query_tokens:
+
+            frequency = term_counts.get(term, 0)
+
+            if frequency == 0:
+                continue
+
+            df = document_frequency.get(term, 0)
+
+            # Positive inverse document frequency
+            idf = math.log(
+                1 + (N - df + 0.5) / (df + 0.5)
+            )
+
+            denominator = frequency + k1 * (
+                1 - b + b * doc_length / max(average_length, 1)
+            )
+
+            score += idf * (
+                frequency * (k1 + 1) / denominator
+            )
+
+        scores.append(score)
+
+    return scores
+
+
+# --------------------------------------------------
+# 4. Retrieve relevant passages
+# --------------------------------------------------
+
+def retrieve(question, top_k):
+
+    raw_scores = calculate_bm25(question)
+
+    ranked_indices = sorted(
+        range(N),
+        key=lambda i: raw_scores[i],
+        reverse=True
+    )
+
+    selected = ranked_indices[:top_k]
+
+    results = []
+
+    for index in selected:
+
+        raw_score = raw_scores[index]
+
+        # Convert BM25 into a bounded score
+        normalized_score = raw_score / (raw_score + 3.0)
+
+        results.append({
+            "index": index,
+            "raw_score": raw_score,
+            "score": normalized_score
+        })
+
+    return results
+
+
+# --------------------------------------------------
+# 5. Extract answer sentences from retrieved passages
+# --------------------------------------------------
+
+def extract_answer(question, retrieved):
+
+    query_words = set(useful_tokens(question))
+
+    if not query_words:
+        return None, []
+
     candidates = []
-    for i in evidence_ids:
-        candidates.extend(re.split(r"(?<=[.!?])\s+", passages[i]))
-    q_words = set(re.findall(r"[a-z0-9]+", q))
-    scored: list[tuple[float, str]] = []
-    for sentence in candidates:
-        s_words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
-        overlap = len(q_words & s_words) / max(1, len(q_words))
-        scored.append((overlap, sentence.strip()))
-    if not scored:
-        return None, 0.0
-    overlap, sentence = max(scored, key=lambda x: x[0])
-    if overlap < 0.12:
-        return None, 0.0
-    return sentence, min(0.86, 0.62 + overlap * 0.5)
+
+    for item in retrieved:
+
+        passage_index = item["index"]
+        passage = passages[passage_index]
+
+        sentences = re.split(
+            r"(?<=[.!?])\s+",
+            passage.strip()
+        )
+
+        for sentence in sentences:
+
+            sentence_words = set(useful_tokens(sentence))
+
+            if not sentence_words:
+                continue
+
+            overlap = query_words.intersection(sentence_words)
+
+            if not overlap:
+                continue
+
+            coverage = len(overlap) / len(query_words)
+
+            # Score sentence relevance
+            sentence_score = (
+                0.75 * coverage +
+                0.25 * item["score"]
+            )
+
+            candidates.append({
+                "sentence": sentence.strip(),
+                "source": passage_index,
+                "coverage": coverage,
+                "score": sentence_score
+            })
+
+    if not candidates:
+        return None, []
+
+    candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    selected = []
+    seen = set()
+
+    for candidate in candidates:
+
+        sentence = candidate["sentence"]
+
+        if sentence.lower() in seen:
+            continue
+
+        # Require reasonable overlap with the question
+        if candidate["coverage"] < 0.45:
+            continue
+
+        selected.append(candidate)
+        seen.add(sentence.lower())
+
+        if len(selected) >= 3:
+            break
+
+    if not selected:
+        return None, []
+
+    answer = " ".join(
+        item["sentence"] for item in selected
+    )
+
+    supporting_sources = list(dict.fromkeys(
+        item["source"] for item in selected
+    ))
+
+    return answer, supporting_sources
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.engine = RagEngine()
-    yield
+# --------------------------------------------------
+# 6. Create FastAPI application
+# --------------------------------------------------
 
+app = FastAPI(
+    title="RAG Colosseum API",
+    description="Lightweight retrieval-augmented question answering API"
+)
 
-app = FastAPI(title="RAG Colosseum", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
+# --------------------------------------------------
+# 7. Request and response formats
+# --------------------------------------------------
+
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+class QueryResponse(BaseModel):
+    answer: Optional[str]
+    sources: list[int]
+    scores: list[float]
+    confidence: float
+
+
+# --------------------------------------------------
+# 8. Query endpoint
+# --------------------------------------------------
+
+@app.post("/query", response_model=QueryResponse)
+def query(request: QueryRequest):
+
+    question = request.question.strip()
+
+    if not question:
+        return QueryResponse(
+            answer=None,
+            sources=[],
+            scores=[],
+            confidence=0.0
+        )
+
+    # Retrieve passages
+    retrieved = retrieve(
+        question,
+        request.top_k
+    )
+
+    if not retrieved or retrieved[0]["raw_score"] <= 0:
+        return QueryResponse(
+            answer=None,
+            sources=[],
+            scores=[],
+            confidence=0.0
+        )
+
+    # Extract answer from evidence
+    answer, supporting_sources = extract_answer(
+        question,
+        retrieved
+    )
+
+    # Calculate a basic confidence estimate
+    best_score = retrieved[0]["score"]
+
+    if answer is None:
+        confidence = 0.0
+    else:
+        confidence = best_score
+
+    # Abstain if there is insufficient evidence
+    if answer is None or best_score < 0.15:
+
+        answer = None
+        confidence = 0.0
+        supporting_sources = []
+
+    # Return sources and scores in matching order
+    source_score_map = {
+        item["index"]: item["score"]
+        for item in retrieved
+    }
+
+    ordered_sources = sorted(
+        supporting_sources,
+        key=lambda index: source_score_map[index],
+        reverse=True
+    )
+
+    ordered_scores = [
+        round(source_score_map[index], 4)
+        for index in ordered_sources
+    ]
+
+    return QueryResponse(
+        answer=answer,
+        sources=ordered_sources,
+        scores=ordered_scores,
+        confidence=round(confidence, 4)
+    )
+
+
+# --------------------------------------------------
+# 9. Health check
+# --------------------------------------------------
+
 @app.get("/")
-def health() -> dict[str, Any]:
-    return {"status": "ok", "passages": 50}
+def home():
 
-
-@app.get("/health")
-def health_check() -> dict[str, Any]:
-    return {"status": "ok", "passages": 50}
-
-
-@app.post("/query")
-def query(req: Query) -> dict[str, Any]:
-    engine: RagEngine = app.state.engine
-    try:
-        with engine.lock:
-            return engine.respond(req.question, req.top_k)
-    except Exception as exc:
-        log.exception("Query failed")
-        raise HTTPException(status_code=500, detail="Query processing failed") from exc
+    return {
+        "status": "running",
+        "message": "RAG Colosseum API is ready",
+        "passages_loaded": len(passages)
+    }
