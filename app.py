@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 # --------------------------------------------------
 # 1. INITIALIZE APPLICATION
@@ -25,7 +25,10 @@ app.add_middleware(
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-model = SentenceTransformer(MODEL_NAME)
+model = TextEmbedding(
+    model_name=MODEL_NAME,
+    threads=1
+)
 
 # --------------------------------------------------
 # 2. LOAD KNOWLEDGE BASE
@@ -93,10 +96,14 @@ passage_ids = [p["id"] for p in passages]
 # 3. GENERATE PASSAGE EMBEDDINGS
 # --------------------------------------------------
 
-passage_embeddings = model.encode(
-    texts,
-    normalize_embeddings=True,
-    convert_to_numpy=True
+def normalize_embeddings(vectors):
+    vectors = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, 1e-12)
+
+
+passage_embeddings = normalize_embeddings(
+    list(model.embed(texts, batch_size=16))
 )
 
 # --------------------------------------------------
@@ -127,10 +134,8 @@ sentence_texts = [
     s["text"] for s in sentence_records
 ]
 
-sentence_embeddings = model.encode(
-    sentence_texts,
-    normalize_embeddings=True,
-    convert_to_numpy=True
+sentence_embeddings = normalize_embeddings(
+    list(model.embed(sentence_texts, batch_size=16))
 )
 
 # --------------------------------------------------
@@ -148,10 +153,8 @@ class QueryRequest(BaseModel):
 
 def retrieve(question, top_k):
 
-    query_embedding = model.encode(
-        [question],
-        normalize_embeddings=True,
-        convert_to_numpy=True
+    query_embedding = normalize_embeddings(
+        list(model.query_embed(question))
     )[0]
 
     similarities = passage_embeddings @ query_embedding
