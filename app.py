@@ -1,20 +1,19 @@
-
 import json
 import re
 import threading
-import numpy as np
-
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastembed import TextEmbedding
 
 
-# ==================================================
-# 1. APPLICATION
-# ==================================================
+# ============================================================
+# 1. APPLICATION AND MODEL
+# ============================================================
 
 app = FastAPI(title="RAG Colosseum API")
 
@@ -27,679 +26,569 @@ app.add_middleware(
 )
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_LOCK = threading.Lock()
 
 model = TextEmbedding(
     model_name=MODEL_NAME,
-    threads=1
+    threads=1,
 )
 
-model_lock = threading.Lock()
 
-
-# ==================================================
-# 2. LOAD KNOWLEDGE BASE
-# ==================================================
+# ============================================================
+# 2. LOAD THE 50-PASSAGE KNOWLEDGE BASE
+# ============================================================
 
 DATA_PATH = Path("data/dataset.json")
 
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    raw_data = json.load(f)
-
 
 def load_passages(data):
-
     if isinstance(data, list):
         items = data
-    else:
-        items = data.get(
-            "passages",
-            data.get("documents", data.get("data", []))
+    elif isinstance(data, dict):
+        items = (
+            data.get("passages")
+            or data.get("documents")
+            or data.get("data")
+            or []
         )
+    else:
+        items = []
 
-    passages = []
+    loaded = []
 
     for i, item in enumerate(items):
-
         if isinstance(item, str):
             text = item
-            index = i
-
+            passage_id = i
         elif isinstance(item, dict):
             text = (
                 item.get("text")
                 or item.get("content")
                 or item.get("passage")
             )
-
-            index = item.get("id", item.get("index", i))
-
+            passage_id = item.get("id", item.get("index", i))
         else:
             continue
 
         if text:
-            passages.append({
-                "id": int(index),
-                "text": str(text)
+            loaded.append({
+                "id": int(passage_id),
+                "text": str(text).strip(),
             })
 
-    passages.sort(key=lambda x: x["id"])
+    loaded.sort(key=lambda x: x["id"])
 
-    if len(passages) != 50:
+    if len(loaded) != 50:
         raise ValueError(
-            f"Expected 50 passages, got {len(passages)}"
+            f"Expected 50 passages, loaded {len(loaded)}. "
+            "Check data/dataset.json."
         )
 
-    if [p["id"] for p in passages] != list(range(50)):
-        raise ValueError("Passage IDs must be 0 to 49")
+    if [p["id"] for p in loaded] != list(range(50)):
+        raise ValueError("Passage IDs must be exactly 0 through 49.")
 
-    return passages
-
-
-passages = load_passages(raw_data)
-
-texts = [p["text"] for p in passages]
-passage_ids = [p["id"] for p in passages]
+    return loaded
 
 
-# ==================================================
-# 3. TOKENIZATION AND LEXICAL RETRIEVAL
-# ==================================================
+with DATA_PATH.open("r", encoding="utf-8") as f:
+    passages = load_passages(json.load(f))
+
+PASSAGE_TEXTS = [p["text"] for p in passages]
+PASSAGE_IDS = [p["id"] for p in passages]
+PASSAGE_BY_ID = {p["id"]: p["text"] for p in passages}
+
+
+# ============================================================
+# 3. TOKENIZATION
+# ============================================================
 
 STOPWORDS = {
-    "what", "which", "who", "when", "where", "why",
-    "how", "is", "are", "was", "were", "the", "a",
-    "an", "of", "in", "on", "to", "for", "and",
-    "or", "does", "do", "did", "can", "could",
-    "would", "should", "with", "by", "from",
-    "used", "use", "using", "about", "explain",
-    "tell", "me", "please", "give", "describe",
-    "according", "passage", "system"
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "what", "which", "who", "when", "where", "why", "how",
+    "does", "do", "did", "can", "could", "would", "should", "will",
+    "may", "might", "must", "of", "in", "on", "at", "to", "for",
+    "from", "by", "with", "as", "into", "about", "and", "or",
+    "it", "its", "this", "that", "these", "those", "me", "please",
+    "tell", "explain", "describe", "give", "according", "passage",
+    "system", "use", "used", "using",
 }
 
 
+def normalize_token(token):
+    token = token.lower()
+
+    # Small deterministic normalization suitable for this fixed corpus.
+    if token == "decoupling":
+        return "decouple"
+    if token == "decoupled":
+        return "decouple"
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
+        return token[:-1]
+
+    return token
+
+
 def tokenize(text):
-
-    words = re.findall(
-        r"[a-z0-9]+(?:\.[0-9]+)?",
-        text.lower()
-    )
-
-    result = []
-
-    for word in words:
-
-        if word in STOPWORDS:
-            continue
-
-        # Basic plural normalization
-        if len(word) > 4 and word.endswith("ies"):
-            word = word[:-3] + "y"
-
-        elif len(word) > 4 and word.endswith("s") \
-                and not word.endswith("ss"):
-            word = word[:-1]
-
-        result.append(word)
-
-    return result
+    raw = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", text.lower())
+    return [
+        normalize_token(t)
+        for t in raw
+        if normalize_token(t) not in STOPWORDS
+    ]
 
 
-def lexical_coverage(question, document):
-
-    query_terms = set(tokenize(question))
-
-    if not query_terms:
+def token_coverage(query_tokens, document):
+    if not query_tokens:
         return 0.0
 
-    document_terms = set(tokenize(document))
-
-    matched = query_terms.intersection(document_terms)
-
-    return len(matched) / len(query_terms)
+    doc_tokens = set(tokenize(document))
+    matched = sum(1 for token in query_tokens if token in doc_tokens)
+    return matched / len(query_tokens)
 
 
-# ==================================================
-# 4. SENTENCE SPLITTING
-# ==================================================
+def extract_anchors(question):
+    """Identify capitalized technical names such as Raft, Redis, AdamW, QUIC."""
+    words = re.findall(
+        r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)*\b",
+        question,
+    )
+
+    ignored = {
+        "What", "Which", "Who", "When", "Where", "Why", "How",
+        "Does", "Do", "Did", "Can", "Could", "Would", "Should",
+        "Is", "Are", "The",
+    }
+
+    anchors = []
+    for word in words:
+        if word not in ignored:
+            anchors.extend(tokenize(word))
+
+    # Preserve order and remove duplicates.
+    return list(dict.fromkeys(anchors))
+
+
+def anchor_coverage(anchors, document):
+    if not anchors:
+        return 0.0
+
+    doc_tokens = set(tokenize(document))
+    return sum(1 for a in anchors if a in doc_tokens) / len(anchors)
+
+
+# ============================================================
+# 4. SPLIT PASSAGES INTO SENTENCES
+# ============================================================
 
 sentence_records = []
 
 for passage in passages:
+    pieces = re.split(r"(?<=[.!?])\s+", passage["text"])
 
-    sentences = re.split(
-        r'(?<=[.!?])\s+',
-        passage["text"]
-    )
-
-    for sentence in sentences:
-
+    for sentence in pieces:
         sentence = sentence.strip()
-
         if sentence:
             sentence_records.append({
                 "passage_id": passage["id"],
-                "text": sentence
+                "text": sentence,
             })
 
-
-sentence_texts = [
-    item["text"] for item in sentence_records
-]
+SENTENCE_TEXTS = [x["text"] for x in sentence_records]
 
 
-# ==================================================
-# 5. GENERATE EMBEDDINGS
-# ==================================================
+# ============================================================
+# 5. EMBEDDINGS
+# ============================================================
 
 def normalize_embeddings(vectors):
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if vectors.ndim == 1:
+        vectors = vectors.reshape(1, -1)
 
-    vectors = np.asarray(
-        vectors,
-        dtype=np.float32
-    )
-
-    norms = np.linalg.norm(
-        vectors,
-        axis=1,
-        keepdims=True
-    )
-
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     return vectors / np.maximum(norms, 1e-12)
 
 
-passage_embeddings = normalize_embeddings(
-    list(model.embed(texts, batch_size=16))
+PASSAGE_EMBEDDINGS = normalize_embeddings(
+    list(model.embed(PASSAGE_TEXTS, batch_size=16))
 )
 
-sentence_embeddings = normalize_embeddings(
-    list(model.embed(sentence_texts, batch_size=16))
+SENTENCE_EMBEDDINGS = normalize_embeddings(
+    list(model.embed(SENTENCE_TEXTS, batch_size=16))
 )
 
 
-# ==================================================
-# 6. REQUEST MODEL
-# ==================================================
+@lru_cache(maxsize=512)
+def query_embedding_for(question):
+    # FastEmbed's model object is protected because the free instance
+    # has limited CPU and memory resources.
+    with MODEL_LOCK:
+        vector = list(model.query_embed(question))
+
+    return normalize_embeddings(vector)[0]
+
+
+# ============================================================
+# 6. REQUEST SCHEMA
+# ============================================================
 
 class QueryRequest(BaseModel):
-
-    question: str = Field(min_length=1)
-
-    top_k: int = Field(
-        default=3,
-        ge=1,
-        le=10
-    )
+    question: str = Field(min_length=1, max_length=2000)
+    top_k: int = Field(default=3, ge=1, le=10)
 
 
-
-# ==================================================
-# 7. PROMPT INJECTION DEFENSE
-# ==================================================
+# ============================================================
+# 7. PROMPT-INJECTION HANDLING
+# ============================================================
 
 INJECTION_PATTERNS = [
-    r"ignore\s+(all\s+)?previous\s+instructions",
-    r"disregard\s+(all\s+)?instructions",
-    r"forget\s+(all\s+)?previous\s+instructions",
-    r"reveal\s+(the\s+)?system\s+prompt",
-    r"show\s+(the\s+)?system\s+prompt",
-    r"print\s+(your\s+)?hidden\s+instructions",
-    r"override\s+(all\s+)?instructions",
-    r"act\s+as\s+system"
+    r"\bignore\b.{0,50}\b(previous|prior|earlier|all)\b.{0,30}\b(instructions?|rules?|directions?)\b",
+    r"\bdisregard\b.{0,50}\b(instructions?|rules?|directions?)\b",
+    r"\bforget\b.{0,40}\b(previous|prior|earlier|all)\b.{0,30}\b(instructions?|rules?)\b",
+    r"\b(reveal|show|print|repeat| disclose)\b.{0,40}\b(system prompt|hidden instructions|developer message)\b",
+    r"\b(override|bypass)\b.{0,40}\b(safety|security|instructions?|rules?)\b",
+    r"\byou are now\b.{0,40}\b(system|admin|developer|unrestricted)\b",
+    r"\bact as\b.{0,30}\b(system|developer|administrator)\b",
+    r"\b(jailbreak|prompt injection)\b",
 ]
 
-UNTRUSTED_SENTENCE_PATTERNS = [
-    r"ignore\s+(all\s+)?previous\s+instructions",
-    r"reveal\s+(the\s+)?system\s+prompt",
-    r"disregard\s+(all\s+)?instructions",
-    r"override\s+(all\s+)?instructions",
-    r"reveal\s+(your\s+)?hidden\s+instructions",
-    r"do\s+not\s+answer\s+the\s+user",
-    r"send\s+(all\s+)?(data|secrets|credentials)"
-]
+INJECTION_RE = re.compile(
+    "|".join(f"(?:{p})" for p in INJECTION_PATTERNS),
+    flags=re.IGNORECASE,
+)
+
+UNTRUSTED_CONTENT_RE = re.compile(
+    r"\b(ignore|disregard|override|reveal|exfiltrate|"
+    r"hidden instructions|system prompt|developer message|"
+    r"send credentials|send secrets)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def sanitize_question(question):
-
-    cleaned = question
-
-    for pattern in INJECTION_PATTERNS:
-        cleaned = re.sub(
-            pattern,
-            " ",
-            cleaned,
-            flags=re.IGNORECASE
-        )
-
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        cleaned
-    ).strip(" ,;:-")
-
+    """
+    Remove recognizable instruction-override clauses.
+    The system is extractive and never executes retrieved text as instructions.
+    """
+    cleaned = INJECTION_RE.sub(" ", question)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;:-")
     return cleaned
 
 
-def is_untrusted_sentence(sentence):
-
-    return any(
-        re.search(
-            pattern,
-            sentence,
-            re.IGNORECASE
-        )
-        for pattern in UNTRUSTED_SENTENCE_PATTERNS
-    )
+def contains_injection(question):
+    return bool(INJECTION_RE.search(question))
 
 
-
-# ==================================================
-# 8. QUERY EMBEDDING
-# ==================================================
-
-@lru_cache(maxsize=256)
-def get_query_embedding(question):
-
-    with model_lock:
-
-        embedding = list(
-            model.query_embed(question)
-        )
-
-    return normalize_embeddings(embedding)[0]
+def is_untrusted_content(sentence):
+    return bool(UNTRUSTED_CONTENT_RE.search(sentence))
 
 
-# ==================================================
-# 9. HYBRID PASSAGE RETRIEVAL
-# ==================================================
+# ============================================================
+# 8. HYBRID PASSAGE RETRIEVAL
+# ============================================================
 
 def retrieve(question, top_k):
+    q_tokens = tokenize(question)
+    anchors = extract_anchors(question)
+    q_vector = query_embedding_for(question)
 
-    query_embedding = get_query_embedding(question)
+    dense = PASSAGE_EMBEDDINGS @ q_vector
 
-    dense_scores = (
-        passage_embeddings @ query_embedding
+    lexical = np.array(
+        [token_coverage(q_tokens, text) for text in PASSAGE_TEXTS],
+        dtype=np.float32,
     )
 
-    lexical_scores = np.array([
-        lexical_coverage(question, text)
-        for text in texts
-    ])
-
-    # Combine semantic and lexical relevance
-    hybrid_scores = (
-        0.72 * np.clip(dense_scores, 0, 1)
-        + 0.28 * lexical_scores
+    entity = np.array(
+        [anchor_coverage(anchors, text) for text in PASSAGE_TEXTS],
+        dtype=np.float32,
     )
 
-    ranked = np.argsort(
-        hybrid_scores
-    )[::-1]
+    # Dense retrieval handles paraphrases; lexical/entity matching
+    # distinguishes deliberately similar technical passages.
+    scores = (
+        0.38 * np.clip(dense, 0.0, 1.0)
+        + 0.42 * lexical
+        + 0.20 * entity
+    )
+
+    order = np.argsort(scores)[::-1]
 
     results = []
-
-    for idx in ranked[:top_k]:
-
+    for idx in order[:top_k]:
         results.append({
-            "id": passage_ids[idx],
-            "text": texts[idx],
-            "score": float(hybrid_scores[idx]),
-            "dense": float(dense_scores[idx]),
-            "lexical": float(lexical_scores[idx])
+            "id": PASSAGE_IDS[idx],
+            "text": PASSAGE_TEXTS[idx],
+            "score": float(scores[idx]),
+            "dense": float(dense[idx]),
+            "lexical": float(lexical[idx]),
+            "entity": float(entity[idx]),
         })
 
-    return results, query_embedding
+    return results, q_vector
 
 
+# ============================================================
+# 9. QUESTION INTENT AND FACT CHECKS
+# ============================================================
 
-# ==================================================
-# 10. ENTITY-AWARE FACT EXTRACTION
-# ==================================================
+def question_intent(question):
+    q = question.lower()
 
-def extract_answer(question, query_embedding, results):
-
-    passage_lookup = {
-        item["id"]: item
-        for item in results
+    return {
+        "port": bool(re.search(r"\bport\b", q)),
+        "count": bool(re.search(
+            r"\b(how many|number of|count|quorum)\b", q
+        )),
+        "time": bool(re.search(
+            r"\b(interval|timeout|heartbeat|latency|duration|"
+            r"how long|wait time|rto|lease term)\b", q
+        )),
+        "comparison": bool(re.search(
+            r"\b(compare|comparison|contrast|difference|differences|"
+            r"versus|vs\.?|both)\b", q
+        )),
+        "multi": bool(re.search(r"\band\b", q)),
     }
 
-    interrogatives = {
-        "what", "which", "where", "when",
-        "who", "how", "does", "do", "is",
-        "are", "can", "tell", "explain"
-    }
 
-    # Identify named technologies in the question
-    anchors = [
-        word.lower()
-        for word in re.findall(
-            r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)*\b",
-            question
-        )
-        if word.lower() not in interrogatives
-    ]
+NUMBER_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|sec|s|"
+    r"minutes?|bits?|bytes?|records?|nodes?|replicas?)?\b"
+    r"|\b(one|two|three|four|five|six|seven|eight|nine|ten)\b",
+    flags=re.IGNORECASE,
+)
 
-    # Identify technical acronyms that must be supported
-    acronyms = [
-        word.lower()
-        for word in re.findall(
-            r"\b[A-Z]{2,8}\b",
-            question
-        )
-    ]
 
-    asks_count = bool(re.search(
-        r"\b(how many|number of|count)\b",
-        question,
-        re.IGNORECASE
-    ))
+def sentence_has_requested_fact(sentence, intent, q_tokens):
+    s = sentence.lower()
 
-    asks_port = bool(re.search(
-        r"\bport\b",
-        question,
-        re.IGNORECASE
-    ))
+    if intent["port"]:
+        if "port" not in s or not NUMBER_RE.search(sentence):
+            return False
 
-    asks_time = bool(re.search(
-        r"\b(interval|timeout|latency|duration|"
-        r"heartbeat|how long|wait time)\b",
-        question,
-        re.IGNORECASE
-    ))
+    if intent["count"]:
+        count_terms = {
+            "acceptor", "node", "replica", "participant",
+            "quorum", "member", "server", "layer", "block",
+            "sample", "retry", "round",
+        }
+        asks_count_about = bool(set(q_tokens) & count_terms)
+        if asks_count_about and not NUMBER_RE.search(sentence):
+            return False
 
-    number_pattern = (
-        r"\b\d+(?:\.\d+)?\s*"
-        r"(?:ms|milliseconds?|seconds?|s|minutes?|"
-        r"bits?|bytes?|records?|nodes?|replicas?)?\b"
-        r"|\b(one|two|three|four|five|six|seven|"
-        r"eight|nine|ten)\b"
-    )
+    if intent["time"]:
+        if not NUMBER_RE.search(sentence):
+            return False
+
+    return True
+
+
+# ============================================================
+# 10. FACTUAL SENTENCE RANKING AND ANSWER EXTRACTION
+# ============================================================
+
+def extract_answer(question, q_vector, retrieved):
+    q_tokens = tokenize(question)
+    anchors = extract_anchors(question)
+    intent = question_intent(question)
+
+    allowed_ids = {x["id"] for x in retrieved}
+    passage_scores = {x["id"]: x["score"] for x in retrieved}
 
     candidates = []
 
-    for idx, item in enumerate(sentence_records):
+    for idx, record in enumerate(sentence_records):
+        pid = record["passage_id"]
 
-        pid = item["passage_id"]
-
-        if pid not in passage_lookup:
+        if pid not in allowed_ids:
             continue
 
-        sentence = item["text"]
-        parent = passage_lookup[pid]["text"]
+        sentence = record["text"]
+        parent = PASSAGE_BY_ID[pid]
 
-        # Never use recognized injected instructions as evidence
-        if is_untrusted_sentence(sentence):
+        # Do not treat suspicious retrieved text as instructions or evidence.
+        if is_untrusted_content(sentence):
             continue
 
-        dense = float(
-            sentence_embeddings[idx] @ query_embedding
-        )
+        sent_dense = float(SENTENCE_EMBEDDINGS[idx] @ q_vector)
+        sent_lex = token_coverage(q_tokens, sentence)
+        parent_lex = token_coverage(q_tokens, parent)
+        entity_score = anchor_coverage(anchors, parent)
 
-        sentence_lex = lexical_coverage(
-            question,
-            sentence
-        )
-
-        parent_lex = lexical_coverage(
-            question,
-            parent
-        )
-
-        # Match named entities against the parent passage
-        anchor_score = 0.0
-
-        if anchors:
-            matched = sum(
-                anchor in parent.lower()
-                for anchor in anchors
-            )
-
-            anchor_score = matched / len(anchors)
-
-        # Required acronyms must exist in the supporting passage
-        acronym_valid = all(
-            acronym in parent.lower()
-            for acronym in acronyms
-        )
-
-        if not acronym_valid:
-            continue
-
-        # Combined sentence and passage relevance
         score = (
-            0.25 * max(0.0, dense)
-            + 0.25 * sentence_lex
+            0.18 * max(0.0, sent_dense)
+            + 0.32 * sent_lex
             + 0.25 * parent_lex
-            + 0.25 * anchor_score
+            + 0.25 * entity_score
         )
 
-        has_number = bool(
-            re.search(number_pattern, sentence, re.IGNORECASE)
-        )
-
-        # Prioritize numerical answers when requested
-        if asks_count:
-            score += 0.18 if has_number else -0.18
-
-        # Prioritize measurements and time values
-        if asks_time:
-            score += 0.12 if has_number else -0.12
-
-        # A port answer must actually contain a port and number
-        if asks_port:
-
-            valid_port = (
-                "port" in sentence.lower()
-                and has_number
-            )
-
-            score += 0.18 if valid_port else -0.25
+        if not sentence_has_requested_fact(sentence, intent, q_tokens):
+            score -= 0.35
 
         candidates.append({
             "passage_id": pid,
             "text": sentence,
             "score": score,
-            "dense": dense,
-            "parent_lex": parent_lex,
-            "anchor_score": anchor_score
+            "dense": sent_dense,
+            "sentence_lexical": sent_lex,
+            "parent_lexical": parent_lex,
+            "entity": entity_score,
         })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
 
     if not candidates:
         return None, 0.0, []
 
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
+    # Keep only candidates that contain the requested fact type.
+    valid = [
+        c for c in candidates
+        if sentence_has_requested_fact(c["text"], intent, q_tokens)
+    ]
 
-    best = candidates[0]
+    if not valid:
+        return None, candidates[0]["score"], []
 
-    # Abstention checks
-    if best["dense"] < 0.30:
+    best = valid[0]
+
+    # Avoid answering off-topic or weakly grounded questions.
+    if best["dense"] < 0.28:
         return None, best["score"], []
 
-    if (
-        best["parent_lex"] < 0.15
-        and best["anchor_score"] < 0.5
-    ):
+    if best["sentence_lexical"] == 0 and best["entity"] == 0:
         return None, best["score"], []
 
-    if asks_count and not re.search(
-        number_pattern,
-        best["text"],
-        re.IGNORECASE
-    ):
-        return None, best["score"], []
-
-    if asks_port and not (
-        "port" in best["text"].lower()
-        and re.search(number_pattern, best["text"], re.IGNORECASE)
-    ):
-        return None, best["score"], []
-
-    # Simple questions should get one direct factual sentence
     selected = [best]
 
-    # Multiple sentences only when the question requires synthesis
-    multi_intent = bool(re.search(
-        r"\b(compare|contrast|difference|differences|"
-        r"versus|vs|both)\b",
-        question,
-        re.IGNORECASE
-    )) or bool(re.search(
-        r"\band\b",
-        question,
-        re.IGNORECASE
-    ))
+    # Synthesize only when the question explicitly asks for a comparison,
+    # multiple facts, or contains a clear conjunction.
+    needs_multiple = intent["comparison"] or intent["multi"]
 
-    if multi_intent:
+    if needs_multiple:
+        used = {best["passage_id"]}
 
-        for candidate in candidates[1:]:
-
-            if len(selected) >= min(3, len(results)):
+        for candidate in valid[1:]:
+            if len(selected) >= 3:
                 break
 
-            if candidate["score"] < best["score"] - 0.18:
+            if candidate["score"] < best["score"] - 0.20:
                 continue
 
-            if candidate["dense"] < 0.30:
+            # Prefer a different passage for cross-boundary synthesis,
+            # but allow a second sentence from the same passage if needed.
+            if candidate["passage_id"] in used:
                 continue
 
-            if candidate["passage_id"] == best["passage_id"]:
-                # Allow multiple sentences from the same passage
-                selected.append(candidate)
-                continue
-
-            if candidate["parent_lex"] < 0.15:
+            if candidate["dense"] < 0.28:
                 continue
 
             selected.append(candidate)
+            used.add(candidate["passage_id"])
 
-    answer = " ".join(
-        item["text"] for item in selected
-    )
-
+    answer = " ".join(item["text"] for item in selected)
     return answer, best["score"], selected
 
 
-
-# ==================================================
-# 11. RESPONSE FORMAT
-# ==================================================
+# ============================================================
+# 11. RESPONSE HELPERS
+# ============================================================
 
 def abstain():
-
     return {
         "answer": None,
         "sources": [],
         "scores": [],
-        "confidence": 0.20
+        "confidence": 0.20,
     }
 
 
-
-# ==================================================
-# 12. MAIN API ENDPOINT
-# ==================================================
-
-def abstain():
-
-    return {
-        "answer": None,
-        "sources": [],
-        "scores": [],
-        "confidence": 0.20
-    }
-
+# ============================================================
+# 12. MAIN ENDPOINT
+# ============================================================
 
 @app.post("/query")
 def query_api(request: QueryRequest):
+    original_question = request.question.strip()
 
-    question = sanitize_question(
-        request.question.strip()
-    )
+    if not original_question:
+        return abstain()
 
+    had_injection = contains_injection(original_question)
+    question = sanitize_question(original_question)
+
+    # Pure injection / no remaining factual query: abstain.
     if not question or not tokenize(question):
         return abstain()
 
     top_k = max(1, min(request.top_k, 10))
 
-    # Retrieve passages
-    results, query_embedding = retrieve(
-        question,
-        top_k
-    )
+    retrieved, q_vector = retrieve(question, top_k)
 
-    # Extract answer from supporting sentences
     answer, answer_score, selected = extract_answer(
         question,
-        query_embedding,
-        results
+        q_vector,
+        retrieved,
     )
 
     if answer is None or not selected:
         return abstain()
 
-    # Include only passages supporting the selected answer
-    selected_ids = list(dict.fromkeys(
+    # Cite only passages that contributed selected answer sentences.
+    source_ids = list(dict.fromkeys(
         item["passage_id"] for item in selected
     ))
 
-    score_lookup = {
-        item["id"]: item["score"]
-        for item in results
-    }
+    score_lookup = {x["id"]: x["score"] for x in retrieved}
 
-    selected_ids.sort(
-        key=lambda pid: score_lookup.get(pid, 0),
-        reverse=True
+    source_ids.sort(
+        key=lambda pid: score_lookup.get(pid, 0.0),
+        reverse=True,
     )
 
-    selected_ids = selected_ids[:top_k]
-
-    sources = selected_ids
+    source_ids = source_ids[:top_k]
 
     scores = [
         round(
-            max(
-                0.0,
-                min(1.0, score_lookup[pid])
-            ),
-            4
+            max(0.0, min(1.0, score_lookup[pid])),
+            4,
         )
-        for pid in sources
+        for pid in source_ids
     ]
 
-    confidence = min(
-        0.99,
-        max(0.61, answer_score)
+    # This is a bounded ranking score, not a calibrated probability.
+    confidence = round(
+        max(0.61, min(0.99, float(answer_score))),
+        4,
     )
 
     return {
         "answer": answer,
-        "sources": sources,
+        "sources": source_ids,
         "scores": scores,
-        "confidence": round(confidence, 4)
+        "confidence": confidence,
     }
 
 
-
-# ==================================================
-# 13. HEALTH CHECK
-# ==================================================
+# ============================================================
+# 13. HEALTH AND ROOT ROUTES
+# ============================================================
 
 @app.get("/")
+@app.head("/")
 def home():
-
     return {
         "status": "running",
-        "passages_loaded": len(passages)
+        "passages_loaded": len(passages),
     }
 
 
 @app.get("/health")
+@app.head("/health")
 def health():
-
     return {
         "status": "healthy",
-        "passages_loaded": len(passages)
+        "passages_loaded": len(passages),
     }
