@@ -231,31 +231,65 @@ class QueryRequest(BaseModel):
     )
 
 
+
 # ==================================================
-# 7. PROMPT INJECTION DETECTION
+# 7. PROMPT INJECTION DEFENSE
 # ==================================================
 
 INJECTION_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s+instructions",
     r"disregard\s+(all\s+)?instructions",
+    r"forget\s+(all\s+)?previous\s+instructions",
     r"reveal\s+(the\s+)?system\s+prompt",
     r"show\s+(the\s+)?system\s+prompt",
-    r"print\s+(your\s+)?(hidden\s+)?instructions",
-    r"reveal\s+(your\s+)?hidden\s+instructions",
-    r"act\s+as\s+system",
+    r"print\s+(your\s+)?hidden\s+instructions",
     r"override\s+(all\s+)?instructions",
-    r"forget\s+(all\s+)?previous\s+instructions"
+    r"act\s+as\s+system"
+]
+
+UNTRUSTED_SENTENCE_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"reveal\s+(the\s+)?system\s+prompt",
+    r"disregard\s+(all\s+)?instructions",
+    r"override\s+(all\s+)?instructions",
+    r"reveal\s+(your\s+)?hidden\s+instructions",
+    r"do\s+not\s+answer\s+the\s+user",
+    r"send\s+(all\s+)?(data|secrets|credentials)"
 ]
 
 
-def is_injection(question):
+def sanitize_question(question):
 
-    q = question.lower()
+    cleaned = question
+
+    for pattern in INJECTION_PATTERNS:
+        cleaned = re.sub(
+            pattern,
+            " ",
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        cleaned
+    ).strip(" ,;:-")
+
+    return cleaned
+
+
+def is_untrusted_sentence(sentence):
 
     return any(
-        re.search(pattern, q)
-        for pattern in INJECTION_PATTERNS
+        re.search(
+            pattern,
+            sentence,
+            re.IGNORECASE
+        )
+        for pattern in UNTRUSTED_SENTENCE_PATTERNS
     )
+
 
 
 # ==================================================
@@ -316,53 +350,161 @@ def retrieve(question, top_k):
     return results, query_embedding
 
 
+
 # ==================================================
-# 10. SENTENCE-LEVEL ANSWER EXTRACTION
+# 10. ENTITY-AWARE FACT EXTRACTION
 # ==================================================
 
 def extract_answer(question, query_embedding, results):
 
-    eligible_ids = {
-        item["id"] for item in results
+    passage_lookup = {
+        item["id"]: item
+        for item in results
     }
 
-    eligible_indices = [
-        i for i, item in enumerate(sentence_records)
-        if item["passage_id"] in eligible_ids
+    interrogatives = {
+        "what", "which", "where", "when",
+        "who", "how", "does", "do", "is",
+        "are", "can", "tell", "explain"
+    }
+
+    # Identify named technologies in the question
+    anchors = [
+        word.lower()
+        for word in re.findall(
+            r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)*\b",
+            question
+        )
+        if word.lower() not in interrogatives
     ]
 
-    if not eligible_indices:
-        return None, 0.0, []
+    # Identify technical acronyms that must be supported
+    acronyms = [
+        word.lower()
+        for word in re.findall(
+            r"\b[A-Z]{2,8}\b",
+            question
+        )
+    ]
 
-    dense_scores = (
-        sentence_embeddings @ query_embedding
+    asks_count = bool(re.search(
+        r"\b(how many|number of|count)\b",
+        question,
+        re.IGNORECASE
+    ))
+
+    asks_port = bool(re.search(
+        r"\bport\b",
+        question,
+        re.IGNORECASE
+    ))
+
+    asks_time = bool(re.search(
+        r"\b(interval|timeout|latency|duration|"
+        r"heartbeat|how long|wait time)\b",
+        question,
+        re.IGNORECASE
+    ))
+
+    number_pattern = (
+        r"\b\d+(?:\.\d+)?\s*"
+        r"(?:ms|milliseconds?|seconds?|s|minutes?|"
+        r"bits?|bytes?|records?|nodes?|replicas?)?\b"
+        r"|\b(one|two|three|four|five|six|seven|"
+        r"eight|nine|ten)\b"
     )
 
     candidates = []
 
-    for idx in eligible_indices:
+    for idx, item in enumerate(sentence_records):
 
-        item = sentence_records[idx]
+        pid = item["passage_id"]
 
-        dense = float(dense_scores[idx])
+        if pid not in passage_lookup:
+            continue
 
-        lexical = lexical_coverage(
+        sentence = item["text"]
+        parent = passage_lookup[pid]["text"]
+
+        # Never use recognized injected instructions as evidence
+        if is_untrusted_sentence(sentence):
+            continue
+
+        dense = float(
+            sentence_embeddings[idx] @ query_embedding
+        )
+
+        sentence_lex = lexical_coverage(
             question,
-            item["text"]
+            sentence
         )
 
-        score = (
-            0.72 * max(0.0, dense)
-            + 0.28 * lexical
+        parent_lex = lexical_coverage(
+            question,
+            parent
         )
+
+        # Match named entities against the parent passage
+        anchor_score = 0.0
+
+        if anchors:
+            matched = sum(
+                anchor in parent.lower()
+                for anchor in anchors
+            )
+
+            anchor_score = matched / len(anchors)
+
+        # Required acronyms must exist in the supporting passage
+        acronym_valid = all(
+            acronym in parent.lower()
+            for acronym in acronyms
+        )
+
+        if not acronym_valid:
+            continue
+
+        # Combined sentence and passage relevance
+        score = (
+            0.25 * max(0.0, dense)
+            + 0.25 * sentence_lex
+            + 0.25 * parent_lex
+            + 0.25 * anchor_score
+        )
+
+        has_number = bool(
+            re.search(number_pattern, sentence, re.IGNORECASE)
+        )
+
+        # Prioritize numerical answers when requested
+        if asks_count:
+            score += 0.18 if has_number else -0.18
+
+        # Prioritize measurements and time values
+        if asks_time:
+            score += 0.12 if has_number else -0.12
+
+        # A port answer must actually contain a port and number
+        if asks_port:
+
+            valid_port = (
+                "port" in sentence.lower()
+                and has_number
+            )
+
+            score += 0.18 if valid_port else -0.25
 
         candidates.append({
-            "passage_id": item["passage_id"],
-            "text": item["text"],
+            "passage_id": pid,
+            "text": sentence,
             "score": score,
             "dense": dense,
-            "lexical": lexical
+            "parent_lex": parent_lex,
+            "anchor_score": anchor_score
         })
+
+    if not candidates:
+        return None, 0.0, []
 
     candidates.sort(
         key=lambda x: x["score"],
@@ -371,58 +513,73 @@ def extract_answer(question, query_embedding, results):
 
     best = candidates[0]
 
-    # Reject unrelated and weakly supported questions
+    # Abstention checks
+    if best["dense"] < 0.30:
+        return None, best["score"], []
+
     if (
-        best["dense"] < 0.32
-        or (
-            best["dense"] < 0.48
-            and best["lexical"] < 0.25
-        )
+        best["parent_lex"] < 0.15
+        and best["anchor_score"] < 0.5
     ):
         return None, best["score"], []
 
+    if asks_count and not re.search(
+        number_pattern,
+        best["text"],
+        re.IGNORECASE
+    ):
+        return None, best["score"], []
+
+    if asks_port and not (
+        "port" in best["text"].lower()
+        and re.search(number_pattern, best["text"], re.IGNORECASE)
+    ):
+        return None, best["score"], []
+
+    # Simple questions should get one direct factual sentence
     selected = [best]
 
-    # Cross-passage synthesis
-    compare_words = {
-        "compare", "difference", "differences",
-        "versus", "between", "both", "contrast"
-    }
+    # Multiple sentences only when the question requires synthesis
+    multi_intent = bool(re.search(
+        r"\b(compare|contrast|difference|differences|"
+        r"versus|vs|both)\b",
+        question,
+        re.IGNORECASE
+    )) or bool(re.search(
+        r"\band\b",
+        question,
+        re.IGNORECASE
+    ))
 
-    query_words = set(tokenize(question))
+    if multi_intent:
 
-    is_comparison = bool(
-        query_words.intersection(compare_words)
-    )
+        for candidate in candidates[1:]:
 
-    for candidate in candidates[1:]:
+            if len(selected) >= min(3, len(results)):
+                break
 
-        if len(selected) >= 2:
-            break
+            if candidate["score"] < best["score"] - 0.18:
+                continue
 
-        if candidate["passage_id"] in {
-            item["passage_id"] for item in selected
-        }:
-            continue
+            if candidate["dense"] < 0.30:
+                continue
 
-        if candidate["dense"] < 0.38:
-            continue
+            if candidate["passage_id"] == best["passage_id"]:
+                # Allow multiple sentences from the same passage
+                selected.append(candidate)
+                continue
 
-        if candidate["lexical"] < 0.20:
-            continue
+            if candidate["parent_lex"] < 0.15:
+                continue
 
-        # Avoid unrelated second sentences
-        if candidate["score"] < best["score"] - 0.12:
-            continue
+            selected.append(candidate)
 
-        selected.append(candidate)
-
-    # Keep the extracted factual sentences intact
     answer = " ".join(
         item["text"] for item in selected
     )
 
     return answer, best["score"], selected
+
 
 
 # ==================================================
@@ -439,76 +596,77 @@ def abstain():
     }
 
 
+
 # ==================================================
 # 12. MAIN API ENDPOINT
 # ==================================================
 
+def abstain():
+
+    return {
+        "answer": None,
+        "sources": [],
+        "scores": [],
+        "confidence": 0.20
+    }
+
+
 @app.post("/query")
 def query_api(request: QueryRequest):
 
-    question = request.question.strip()
+    question = sanitize_question(
+        request.question.strip()
+    )
 
-    if not question:
+    if not question or not tokenize(question):
         return abstain()
 
-    # Reject direct instruction override attempts
-    if is_injection(question):
-        return abstain()
+    top_k = max(1, min(request.top_k, 10))
 
-    top_k = request.top_k
-
-    # Retrieve relevant passages
+    # Retrieve passages
     results, query_embedding = retrieve(
         question,
         top_k
     )
 
-    # Extract factual answer only from retrieved passages
+    # Extract answer from supporting sentences
     answer, answer_score, selected = extract_answer(
         question,
         query_embedding,
         results
     )
 
-    if answer is None:
+    if answer is None or not selected:
         return abstain()
 
-    # Supporting source passages
-    selected_ids = {
+    # Include only passages supporting the selected answer
+    selected_ids = list(dict.fromkeys(
         item["passage_id"] for item in selected
+    ))
+
+    score_lookup = {
+        item["id"]: item["score"]
+        for item in results
     }
 
-    source_results = [
-        item for item in results
-        if item["id"] in selected_ids
-    ]
-
-    # Add other retrieved passages if space is available
-    for item in results:
-
-        if len(source_results) >= top_k:
-            break
-
-        if item["id"] not in {
-            x["id"] for x in source_results
-        }:
-            source_results.append(item)
-
-    source_results.sort(
-        key=lambda x: x["score"],
+    selected_ids.sort(
+        key=lambda pid: score_lookup.get(pid, 0),
         reverse=True
     )
 
-    sources = [
-        item["id"] for item in source_results
-    ]
+    selected_ids = selected_ids[:top_k]
+
+    sources = selected_ids
 
     scores = [
         round(
-            max(0.0, min(1.0, item["score"])),
+            max(
+                0.0,
+                min(1.0, score_lookup[pid])
+            ),
             4
         )
-        for item in source_results
+        for pid in sources
     ]
 
     confidence = min(
@@ -522,6 +680,7 @@ def query_api(request: QueryRequest):
         "scores": scores,
         "confidence": round(confidence, 4)
     }
+
 
 
 # ==================================================
